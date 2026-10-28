@@ -6,6 +6,8 @@ include_directories(
 
 add_darling_executable(opendirectoryd
 	src/main.c
+    src/identifier-translation.c
+    src/local-membership-check.c
 )
 
 install(TARGETS opendirectoryd DESTINATION libexec/darling/usr/libexec)

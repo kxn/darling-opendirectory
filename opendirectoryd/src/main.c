@@ -25,6 +25,12 @@
 #include <membership.h>
 #include <membershipPriv.h>
 #include <pwd.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "identifier-translation.h"
+#include "local-membership-check.h"
 
 #include "log.h"
 
@@ -57,127 +63,113 @@ GET_LOG(membership);
 static dispatch_queue_t membership_service_queue = NULL;
 static xpc_connection_t membership_service_listener = NULL;
 
-static void membership_reply_with_error(xpc_object_t incoming_message, int error) {
-	xpc_object_t reply = xpc_dictionary_create_reply(incoming_message);
-	xpc_dictionary_set_int64(reply, OD_RPC_ERROR, error);
-	xpc_connection_send_message(xpc_dictionary_get_remote_connection(incoming_message), reply);
-	xpc_release(reply);
-};
+static void membership_send_reply(xpc_object_t request, xpc_object_t reply) {
+    if (!reply) return;
+    xpc_connection_t connection = xpc_dictionary_get_remote_connection(request);
+    if (connection) xpc_connection_send_message(connection, reply);
+    xpc_release(reply);
+}
 
-// copied in from libinfo
-static const uuid_t _user_compat_prefix = {0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0x00};
-static const uuid_t _group_compat_prefix = {0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0x00, 0x00, 0x00, 0x00};
-#define COMPAT_PREFIX_LEN	(sizeof(uuid_t) - sizeof(id_t))
+static void membership_reply_with_error(xpc_object_t request, int error) {
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    if (!reply) return;
+    xpc_dictionary_set_int64(reply, OD_RPC_ERROR, error);
+    membership_send_reply(request, reply);
+}
 
-static void build_uuid(const uuid_t source, id_t id, uuid_t dest) {
-	// adapted from libinfo
-	uuid_copy(dest, _user_compat_prefix);
-	*((id_t *) &dest[COMPAT_PREFIX_LEN]) = htonl(id);
-};
+static bool read_integer(xpc_object_t message, const char *key, int *result) {
+    xpc_object_t value = xpc_dictionary_get_value(message, key);
+    if (!value || xpc_get_type(value) != XPC_TYPE_INT64) return false;
+    int64_t number = xpc_int64_get_value(value);
+    if (number < INT_MIN || number > INT_MAX) return false;
+    *result = (int)number;
+    return true;
+}
+
+static bool read_data(xpc_object_t message, const char *key, const void **result, size_t *size) {
+    xpc_object_t value = xpc_dictionary_get_value(message, key);
+    if (!value || xpc_get_type(value) != XPC_TYPE_DATA) return false;
+    *size = xpc_data_get_length(value);
+    if (!*size || *size > 1024 * 1024) return false;
+    *result = xpc_data_get_bytes_ptr(value);
+    return *result != NULL;
+}
 
 static void rpc_mbr_identifier_translate(xpc_object_t message) {
-	int target_type = xpc_dictionary_get_int64(message, "requesting");
-	int id_type = xpc_dictionary_get_int64(message, "type");
-	size_t identifier_size = 0;
-	const void* identifier = xpc_dictionary_get_data(message, "identifier", &identifier_size);
+    int target, type, kind;
+    const void *identifier;
+    size_t size;
+    if (!read_integer(message, "requesting", &target) || !read_integer(message, "type", &type) ||
+        !read_data(message, "identifier", &identifier, &size)) {
+        membership_reply_with_error(message, EINVAL);
+        return;
+    }
+    void *result = NULL;
+    size_t result_size = 0;
+    int status = od_identifier_resolve(type, identifier, size, target, &result, &result_size, &kind);
+    if (status) { membership_reply_with_error(message, status); return; }
+    xpc_object_t reply = xpc_dictionary_create_reply(message);
+    if (reply) {
+        xpc_dictionary_set_data(reply, "identifier", result, result_size);
+        xpc_dictionary_set_int64(reply, "rectype", kind);
+        xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
+    }
+    free(result);
+    membership_send_reply(message, reply);
+}
 
-
-	if (id_type == ID_TYPE_USERNAME && target_type == ID_TYPE_UUID) {
-		char tmp_string[256];
-		strncpy(tmp_string, identifier, (identifier_size < sizeof(tmp_string)) ? identifier_size : sizeof(tmp_string));
-		tmp_string[(identifier_size < sizeof(tmp_string)) ? identifier_size : sizeof(tmp_string) - 1] = '\0';
-		struct passwd* pw = getpwnam(tmp_string);
-
-		FILE* logfile = fopen("/tmp/odd.log", "a");
-		fprintf(logfile, "name = %s; pw = %p; id length = %zu; id = %*s", tmp_string, pw, identifier_size, (int)identifier_size, (const char*)identifier);
-		fclose(logfile);
-
-		if (!pw) {
-			membership_reply_with_error(message, EINVAL);
-			return;
-		}
-
-		uuid_t tmp_uuid;
-
-		build_uuid(_user_compat_prefix, pw->pw_uid, tmp_uuid);
-
-		xpc_object_t reply = xpc_dictionary_create_reply(message);
-
-		xpc_dictionary_set_data(reply, "identifier", tmp_uuid, sizeof(tmp_uuid));
-		xpc_dictionary_set_int64(reply, "rectype", MBR_REC_TYPE_USER);
-
-		xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
-		xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
-		xpc_release(reply);
-	} else {
-		membership_reply_with_error(message, ENOSYS);
-	}
-};
+static void membership_reply_result(xpc_object_t message, int status, int member) {
+    if (status) { membership_reply_with_error(message, status); return; }
+    xpc_object_t reply = xpc_dictionary_create_reply(message);
+    if (!reply) return;
+    xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
+    xpc_dictionary_set_bool(reply, "ismember", member != 0);
+    membership_send_reply(message, reply);
+}
 
 static void rpc_mbr_check_service_membership(xpc_object_t message) {
-	int user_id_type = xpc_dictionary_get_int64(message, "user_idtype");
-	size_t user_id_size = 0;
-	const uint8_t* user_id = xpc_dictionary_get_data(message, "user_id", &user_id_size);
-	const char* service = xpc_dictionary_get_string(message, "service");
-
-	if (user_id_type != ID_TYPE_UUID || user_id_size != sizeof(uuid_t)) {
-		membership_reply_with_error(message, EINVAL);
-		return;
-	}
-
-	xpc_object_t reply = xpc_dictionary_create_reply(message);
-
-	// Darling doesn't really need permissions checking since everything happens within a container anyways, so just report that the user is allowed by the service.
-	xpc_dictionary_set_bool(reply, "ismember", true);
-
-	xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
-	xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
-	xpc_release(reply);
-};
-
-static void rpc_mbr_set_identifier_ttl(xpc_object_t message) {
-	int id_type = xpc_dictionary_get_int64(message, "type");
-	size_t id_size = 0;
-	const void* id = xpc_dictionary_get_data(message, "identifier", &id_size);
-	unsigned int ttl_seconds = xpc_dictionary_get_int64(message, "ttl");
-
-	// just ignore this and return success
-
-	xpc_object_t reply = xpc_dictionary_create_reply(message);
-	xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
-	xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
-	xpc_release(reply);
-};
+    int user_type;
+    const void *user;
+    size_t user_size;
+    xpc_object_t service_value = xpc_dictionary_get_value(message, "service");
+    if (!read_integer(message, "user_idtype", &user_type) || !read_data(message, "user_id", &user, &user_size) ||
+        !service_value || xpc_get_type(service_value) != XPC_TYPE_STRING) {
+        membership_reply_with_error(message, EINVAL);
+        return;
+    }
+    const char *service = xpc_string_get_string_ptr(service_value);
+    if (!service || !*service) { membership_reply_with_error(message, EINVAL); return; }
+    int member = 0;
+    int status = linuxcode_check_service_membership(user_type, user, user_size, service, &member);
+    membership_reply_result(message, status, member);
+}
 
 static void rpc_mbr_check_membership(xpc_object_t message) {
-	int user_id_type = xpc_dictionary_get_int64(message, "user_idtype");
-	int group_id_type = xpc_dictionary_get_int64(message, "group_idtype");
-	size_t user_id_size = 0;
-	const void* user_id = xpc_dictionary_get_data(message, "user_id", &user_id_size);
-	size_t group_id_size = 0;
-	const void* group_id = xpc_dictionary_get_data(message, "group_id", &group_id_size);
-	bool refresh = xpc_dictionary_get_bool(message, "refresh");
+    int user_type, group_type;
+    const void *user, *group;
+    size_t user_size, group_size;
+    xpc_object_t refresh = xpc_dictionary_get_value(message, "refresh");
+    if (!read_integer(message, "user_idtype", &user_type) || !read_integer(message, "group_idtype", &group_type) ||
+        !read_data(message, "user_id", &user, &user_size) || !read_data(message, "group_id", &group, &group_size) ||
+        !refresh || xpc_get_type(refresh) != XPC_TYPE_BOOL) {
+        membership_reply_with_error(message, EINVAL);
+        return;
+    }
+    int member = 0;
+    int status = linuxcode_check_membership(user_type, user, user_size, group_type, group, group_size,
+                                           xpc_bool_get_value(refresh), &member);
+    membership_reply_result(message, status, member);
+}
 
-	xpc_object_t reply = xpc_dictionary_create_reply(message);
-
-	// TODO: actually implement this
-	//
-	// While Darling doesn't need permissions checking, it may be useful to correctly determine whether a user is part of a given group.
-	xpc_dictionary_set_bool(reply, "ismember", true);
-
-	xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
-	xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
-	xpc_release(reply);
-};
+static void rpc_mbr_set_identifier_ttl(xpc_object_t message) {
+    /* This local backend performs fresh lookups and has no identifier cache. */
+    membership_reply_with_error(message, ENOSYS);
+}
 
 static void rpc_mbr_cache_flush(xpc_object_t message) {
-	// just ignore this and return success
-
-	xpc_object_t reply = xpc_dictionary_create_reply(message);
-	xpc_dictionary_set_int64(reply, OD_RPC_ERROR, 0);
-	xpc_connection_send_message(xpc_dictionary_get_remote_connection(message), reply);
-	xpc_release(reply);
-};
+    /* There is no cache to retain stale records: flush is already complete. */
+    membership_reply_with_error(message, 0);
+}
 
 static void handle_new_membership_connection(xpc_connection_t connection) {
 	xpc_connection_set_event_handler(connection, ^(xpc_object_t object) {
@@ -186,9 +178,9 @@ static void handle_new_membership_connection(xpc_connection_t connection) {
 		if (type == XPC_TYPE_DICTIONARY) {
 			membership_log_debug("membership connection received dictionary: %@", object);
 
-			int rpc_version = xpc_dictionary_get_int64(object, OD_RPC_VERSION);
+			int rpc_version = 0;
 
-			if (rpc_version != ODD_MEMBERSHIP_CURRENT_RPC_VERSION) {
+			if (!read_integer(object, OD_RPC_VERSION, &rpc_version) || rpc_version != ODD_MEMBERSHIP_CURRENT_RPC_VERSION) {
 				membership_log_error("invalid RPC version %d in message: %@", rpc_version, object);
 				membership_reply_with_error(object, EINVAL);
 				return;
@@ -199,6 +191,7 @@ static void handle_new_membership_connection(xpc_connection_t connection) {
 			if (!rpc_name) {
 				membership_log_error("no RPC procedure name in message: %@", object);
 				membership_reply_with_error(object, EINVAL);
+                return;
 			}
 
 			membership_log_debug("RPC procedure call message: %@", object);
